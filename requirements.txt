@@ -1,0 +1,11 @@
+line-bot-sdk==3.7.0
+flask==3.0.0
+azure-ai-translation-text==1.0.0
+google-api-python-client
+geopy     
+gspread    
+oauth2client       
+apscheduler
+beautifulsoup4
+PyPDF2==3.0.1
+nltk==3.8.1
