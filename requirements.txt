@@ -9,3 +9,8 @@ apscheduler
 beautifulsoup4
 PyPDF2==3.0.1
 nltk==3.8.1
+
+requests
+google-auth
+pdfplumber
+openai  # Uncomment if using OpenAI

@@ -1,56 +1,33 @@
 from flask import Flask, request
 import json, random, requests, os, time, re
 from linebot import LineBotApi, WebhookHandler
+from linebot.models import *
 from bs4 import BeautifulSoup
 import urllib.parse
-from linebot.models import *
-'''
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage, QuickReply, 
-    QuickReplyButton, MessageAction, FlexSendMessage, LocationMessage, 
-    PostbackAction, PostbackEvent, TemplateSendMessage, ButtonsTemplate)
-'''
-#Azure Translation
 from azure.ai.translation.text import TextTranslationClient
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
-
-#Money
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime, timedelta, timezone, timedelta
-
-#calender
+from datetime import datetime, timedelta, timezone
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from apscheduler.schedulers.background import BackgroundScheduler
-
-#read env
-from oauth2client.service_account import ServiceAccountCredentials
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-
-# -------- New Imports for PDF Processing and Q&A --------
-import PyPDF2
-import io
-from linebot.models import FileMessage
-from linebot.exceptions import LineBotApiError
+# --- New imports for ChatPDF ---
+import pdfplumber
 import tempfile
-import nltk
-from nltk.tokenize import word_tokenize
-from nltk.corpus import stopwords
-import string
-import os
 
-random_list=[]
+random_list = []
 last_msg = ""
 memlist = ""
+# --- New global variable for ChatPDF ---
+user_pdf_data = {}  # Store PDF text per user
 
 app = Flask(__name__)
 
 # -------- LINE BOT 憑證 --------
 access_token = os.getenv("access_token")
-channel_secret =  os.getenv("channel_secret")
+channel_secret = os.getenv("channel_secret")
 line_bot_api = LineBotApi(access_token)
 line_handler = WebhookHandler(channel_secret)
 
@@ -59,12 +36,14 @@ API_KEY = os.getenv("API_KEY")
 ENDPOINT = os.getenv("ENDPOINT")
 REGION = os.getenv("REGION")
 
+# --- New environment variable for ChatPDF (if using AI, e.g., OpenAI) ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Uncomment if using OpenAI
+
 # money
 def setup_sheets_client():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    
     credentials_dict = {
-        "type" :"service_account",
+        "type": "service_account",
         "project_id": os.getenv("project_id_money"),
         "private_key_id": os.getenv("private_key_id_money"),
         "private_key": os.getenv("private_key_money").replace('\\n', '\n'),
@@ -72,17 +51,46 @@ def setup_sheets_client():
         "client_id": os.getenv("client_id_money"),
         "auth_uri": "https://accounts.google.com/o/oauth2/auth",
         "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url":"https://www.googleapis.com/oauth2/v1/certs",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         "client_x509_cert_url": os.getenv("client_x509_cert_url_money"),
         "universe_domain": "googleapis.com"
     }
-    
-
     creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scope)
     client = gspread.authorize(creds)
     return client
 sheets_client = setup_sheets_client()
 user_data = {}
+
+# -------- ChatPDF Functions --------
+def extract_pdf_text(file_path):
+    """Extract text from a PDF file using pdfplumber."""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            text = ""
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+        return text
+    except Exception as e:
+        print(f"PDF extraction failed: {e}")
+        return None
+
+def process_pdf_query(pdf_text, query):
+    """Process a user query about the PDF content (simple keyword search)."""
+    # Replace this with AI-based processing (e.g., OpenAI) if needed
+    if not pdf_text:
+        return "No PDF content available."
+    # Simple keyword-based response
+    if query.lower() in pdf_text.lower():
+        # Find relevant snippet (first 100 characters around the keyword)
+        index = pdf_text.lower().index(query.lower())
+        start = max(0, index - 50)
+        end = min(len(pdf_text), index + len(query) + 50)
+        snippet = pdf_text[start:end]
+        return f"Found in PDF: ...{snippet}..."
+    return "No relevant information found for your query."
+
+# Existing functions (foodpush, drinkpush, listpush, randomone, weather, azure_translate, choose, money, foodie, location, get_calendar_service, add_event, delete_event_by_keyword, get_today_events, parse_intent, extract_datetime, extract_event_info, daily_push, calender, start_scheduler) remain unchanged.
+# [Existing functions omitted for brevity; assume they are included here as in the original app.py]
 
 # -------- 抽籤功能 --------
 def foodpush():
@@ -144,7 +152,7 @@ def randomone(tk, msg, last_msg_01, memlist):
     elif msg == '清空清單':
         random_list.clear()
         line_bot_api.reply_message(tk, TextSendMessage(text='已清空抽選清單'))
-    elif msg == '給我一些想法!':
+    elif msg == '給我一些想法':
         line_bot_api.reply_message(tk, listpush())
     elif msg == '吃什麼':
         line_bot_api.reply_message(tk, foodpush())
@@ -173,52 +181,124 @@ def randomone(tk, msg, last_msg_01, memlist):
 
 # -------- 天氣查詢功能 --------
 def weather(address):
-    result = {}
-    code = os.getenv('code')
-    try:
-        urls = [
-            f'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization={code}',
-            f'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001?Authorization={code}'
-        ]
-        for url in urls:
+    def nowWeather(address):
+        result = {}
+        code = 'CWA-9ECE9E2D-1DF4-45DB-8999-FAC76234B2A3'
+
+        # 即時天氣
+        try:
+            urls = [
+                f'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0001-001?Authorization={code}',
+                f'https://opendata.cwa.gov.tw/api/v1/rest/datastore/O-A0003-001?Authorization={code}'
+            ]
+            for url in urls:
+                req = requests.get(url) 
+                data = req.json()
+                station = data['records']['Station']
+                for i in station:
+                    city = i['GeoInfo']['CountyName']
+                    area = i['GeoInfo']['TownName']
+                    key = f'{city}{area}'
+                    if key not in result:
+                        weather = i['WeatherElement']['Weather']
+                        temp = i['WeatherElement']['AirTemperature']
+                        humid = i['WeatherElement']['RelativeHumidity']
+                        #if({weather}==-99):
+                        #    result[key] = f'目前溫度 {temp}°C，相對濕度 {humid}%'
+                        if ((weather == -99) or (temp == -99) or (temp == -99)):
+                            result[key] = f'目前資料有誤請稍後再試'
+                        else:
+                            result[key] = f'目前天氣：{weather}，溫度 {temp}°C，相對濕度 {humid}%'
+        except Exception as e:
+            print("即時天氣抓取失敗:", e)
+
+
+        # 回傳結果
+        output = '找不到氣象資訊'
+        for key, value in result.items():
+            if key in address:
+                output = f'{value}'
+                #output = f'{value}'
+                break
+
+        return output
+    
+    def futureWeather(address):
+        result = {}
+        code = 'CWA-9ECE9E2D-1DF4-45DB-8999-FAC76234B2A3'
+
+        # 未來12小時天氣
+        try:
+            url = f'https://opendata.cwa.gov.tw/api/v1/rest/datastore/F-C0032-001?Authorization={code}'
             req = requests.get(url)
             data = req.json()
-            station = data['records']['Station']
-            for i in station:
-                city = i['GeoInfo']['CountyName']
-                area = i['GeoInfo']['TownName']
-                key = f'{city}{area}'
+            
+            locations = data['records']['location']
+            for loc in locations:
+                city = loc['locationName']
+                weather_elements = loc['weatherElement']
+                
+                # weather_elements 每個是不同類型：Wx(天氣狀況)、PoP(降雨機率)、MinT(最低溫)、MaxT(最高溫)、CI(舒適度)
+                weather_info = {}
+                for element in weather_elements:
+                    element_name = element['elementName']
+                    weather_info[element_name] = element['time'][0]['parameter']['parameterName']  # 取未來第一個時段
+                
+                key = f'{city}'
                 if key not in result:
-                    weather = i['WeatherElement']['Weather']
-                    temp = i['WeatherElement']['AirTemperature']
-                    humid = i['WeatherElement']['RelativeHumidity']
-                    result[key] = f'目前天氣：{weather}，溫度 {temp}°C，相對濕度 {humid}%'
-    except:
-        return "🌧️ 目前無法取得天氣資料"
+                    # 判斷資料是否完整
+                    if ('Wx' not in weather_info) or ('PoP' not in weather_info) or ('MinT' not in weather_info) or ('MaxT' not in weather_info):
+                        result[key] = f'目前資料有誤請稍後再試'
+                    else:
+                        result[key] = f"未來12小時天氣：{weather_info['Wx']}，降雨機率 {weather_info['PoP']}%，溫度 {weather_info['MinT']}°C ~ {weather_info['MaxT']}°C"
+        except Exception as e:
+            print("未來12小時天氣抓取失敗:", e)
 
-    try:
-        aqi_url = 'https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key=你的 AQI 金鑰&limit=1000&format=JSON'
-        req = requests.get(aqi_url)
-        data = req.json()
-        records = data['records']
-        aqi_status = ["良好", "普通", "對敏感族群不健康", "對所有族群不健康", "非常不健康", "危害"]
 
-        for item in records:
-            county = item['county']
-            sitename = item['sitename']
-            aqi = int(item['aqi'])
-            status = aqi_status[min(aqi // 50, 5)]
-            key = f'{county}{sitename}'
-            for k in result:
-                if county in k:
-                    result[k] += f'\n\nAQI：{aqi}，空氣品質{status}。'
-    except:
-        pass
 
-    for key, value in result.items():
-        if key in address:
-            return f'「{address}」\n{value}\n\n🔗 [詳細內容請見中央氣象署官網](https://www.cwa.gov.tw/)'
-    return "找不到天氣資訊"
+        # 回傳結果
+        output = '找不到氣象資訊'
+        for key, value in result.items():
+            if key in address:
+                output = f'{value}'
+                break
+
+        return output
+    
+    def air(address):
+        result = {}
+
+        # 空氣品質
+        try:
+            aqi_url = 'https://data.moenv.gov.tw/api/v2/aqx_p_432?api_key=eba9f0a9-069d-4d66-bfe6-733dcefa4302&limit=1000&format=JSON'
+            req = requests.get(aqi_url)
+            data = req.json()
+            records = data['records']
+            aqi_status = ["良好", "普通", "對敏感族群不健康", "對所有族群不健康", "非常不健康", "危害"]
+            
+            # 建立縣市的第一筆資料
+            county_first_record = {}
+
+            for item in records:
+                county = item['county']
+                if county not in county_first_record:
+                    aqi = int(item['aqi'])
+                    status = aqi_status[min(aqi // 50, 5)]
+                    county_first_record[county] = f'空氣品質{status}，AQI：{aqi}。'
+
+        except Exception as e:
+            print("空氣品質抓取失敗:", e)
+
+        # 回傳結果
+        output = '找不到氣象資訊'
+        for county, info in county_first_record.items():
+            if county in address:
+                output = info
+                break
+
+        return output
+    result = f"{nowWeather(address)}\n\n{futureWeather(address)}\n\n{air(address)}\n\n🔗 [詳細內容請見中央氣象署官網](https://www.cwa.gov.tw/)'"
+    return result
 
 # -------- 翻譯功能 --------
 def azure_translate(user_input, to_language):
@@ -273,54 +353,28 @@ def chooseLen(tk, msg):
 # 開啟指定的 Google 試算表
 sheet = sheets_client.open("python money").sheet1
 
-def choose(num, month_str):
-    if num == 1:
-        choose = TextSendMessage(
-            text='請選擇分類',
-            quick_reply=QuickReply(
-                items=[
-                    QuickReplyButton(action=MessageAction(label='餐飲', text="餐飲")),
-                    QuickReplyButton(action=MessageAction(label='交通', text="交通")),
-                    QuickReplyButton(action=MessageAction(label='購物', text="購物")),
-                    QuickReplyButton(action=MessageAction(label='醫療', text="醫療")),
-                    QuickReplyButton(action=MessageAction(label='娛樂', text="娛樂")),
-                    QuickReplyButton(action=MessageAction(label='其他', text="其他")),
-                ]
-            )
-            
+def choose():
+    choose = TextSendMessage(
+        text='請選擇分類',
+        quick_reply=QuickReply(
+            items=[
+                QuickReplyButton(action=MessageAction(label='餐飲', text="餐飲")),
+                QuickReplyButton(action=MessageAction(label='交通', text="交通")),
+                QuickReplyButton(action=MessageAction(label='購物', text="購物")),
+                QuickReplyButton(action=MessageAction(label='醫療', text="醫療")),
+                QuickReplyButton(action=MessageAction(label='娛樂', text="娛樂")),
+                QuickReplyButton(action=MessageAction(label='其他', text="其他")),
+            ]
         )
-    elif num == 2:
-        choose = TextSendMessage(
-            text='請選擇要查詢的分類：',
-            quick_reply=QuickReply(
-                quick_replies = [
-                    QuickReplyButton(action=MessageAction(label='餐飲', text="查 餐飲")),
-                    QuickReplyButton(action=MessageAction(label='交通', text="查 交通")),
-                    QuickReplyButton(action=MessageAction(label='購物', text="查 購物")),
-                    QuickReplyButton(action=MessageAction(label='醫療', text="查 醫療")),
-                    QuickReplyButton(action=MessageAction(label='娛樂', text="查 娛樂")),
-                    QuickReplyButton(action=MessageAction(label='其他', text="查 其他")),
-                ]
-            )
-        )
-    elif num == 3:
-        choose = TextSendMessage(
-            text='請選擇要查詢的類別：',
-            quick_reply=QuickReply(
-                quick_replies = [
-                    QuickReplyButton(action=MessageAction(label='餐飲', text=f"查詢月類別 {month_str} 餐飲")),
-                    QuickReplyButton(action=MessageAction(label='交通', text=f"查詢月類別 {month_str} 交通")),
-                    QuickReplyButton(action=MessageAction(label='購物', text=f"查詢月類別 {month_str} 購物")),
-                    QuickReplyButton(action=MessageAction(label='醫療', text=f"查詢月類別 {month_str} 醫療")),
-                    QuickReplyButton(action=MessageAction(label='娛樂', text=f"查詢月類別 {month_str} 娛樂")),
-                    QuickReplyButton(action=MessageAction(label='其他', text=f"查詢月類別 {month_str} 其他")),
-                ]
-            )
-        )
+    )
+  
     return choose
 
 def money(tk, msg, user_id):
-    if msg in ["餐飲", "交通", "購物","醫療","娛樂", "其他"]:
+    if msg == '我要記帳':
+        line_bot_api.reply_message(tk, choose())
+        user_data[user_id] = {"category": None, "amount": None}
+    elif msg in ["餐飲", "交通", "購物","醫療","娛樂", "其他"]:
         if user_id in user_data:  # 確認用戶有先執行「我要記帳」
             user_data[user_id]["category"] = msg
             line_bot_api.reply_message(tk, TextSendMessage(text=f'你選擇了 {msg} 類別，請輸入金額。'))
@@ -490,7 +544,7 @@ def money(tk, msg, user_id):
     # 其他無效輸入
     
     else:
-        line_bot_api.reply_message(tk, TextSendMessage(text='請輸入關鍵字來進行記帳操作\n- 我要記帳\n- 查詢\n- 查詢類別\n- 查詢日期 YYYY-MM-DD\n- 查詢月 YYYY-MM\n- 查詢月類別 YYYY-MM'))
+        line_bot_api.reply_message(tk, TextSendMessage(text='請輸入關鍵字來進行記帳操作\n- 我要記帳\n- 查詢\n- 查 {類別}\n- 查詢日期 YYYY-MM-DD\n- 查詢月 YYYY-MM\n- 查詢月類別 YYYY-MM {類別}'))
 
 # -------- 查詢附近美食 --------
 main_menu = {
@@ -929,211 +983,47 @@ def start_scheduler():
     scheduler.add_job(daily_push, 'cron', hour=8, minute=0)
     scheduler.start()
 
-
-# Set NLTK data path to the project’s nltk_data folder
-nltk.data.path.append(os.path.join(os.path.dirname(__file__), 'nltk_data'))
-
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    nltk.download('punkt')
-    nltk.download('stopwords')
-
-# With this (optional, if you want to verify):
-try:
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('corpora/stopwords')
-except LookupError:
-    raise Exception("NLTK data not found in project’s nltk_data folder. Please include punkt and stopwords.")
-
-# -------- PDF Processing Functions --------
-def extract_text_from_pdf(file_content):
-    try:
-        pdf_file = io.BytesIO(file_content)
-        pdf_reader = PyPDF2.PdfReader(pdf_file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() or ""
-        return text.strip()
-    except Exception as e:
-        return f"Error extracting text from PDF: {str(e)}"
-
-def preprocess_text(text):
-    # Tokenize and clean text for Q&A
-    tokens = word_tokenize(text.lower())
-    # Remove punctuation and stopwords
-    stop_words = set(stopwords.words('english'))  # Adjust for other languages if needed
-    tokens = [word for word in tokens if word not in string.punctuation and word not in stop_words]
-    return tokens, text
-
-def simple_qa(question, tokens, original_text):
-    # Basic keyword-based Q&A
-    question_tokens = word_tokenize(question.lower())
-    question_keywords = [word for word in question_tokens if word not in string.punctuation]
-    
-    # Search for keywords in the tokenized text
-    relevant_sentences = []
-    for sentence in original_text.split('.'):
-        sentence_lower = sentence.lower()
-        if any(keyword in sentence_lower for keyword in question_keywords):
-            relevant_sentences.append(sentence.strip())
-    
-    if relevant_sentences:
-        return "\n".join(relevant_sentences[:3])  # Return up to 3 relevant sentences
-    return "Sorry, I couldn't find an answer in the PDF."
-
-
-# -------- PDF Handler --------
-@line_handler.add(MessageEvent, message=FileMessage)
-def handle_file_message(event):
-    global last_msg
-    tk = event.reply_token
-    user_id = event.source.user_id
-    file_id = event.message.id
-
-    if last_msg == "pdf_scan":
-        try:
-            message_content = line_bot_api.get_message_content(file_id)
-            file_content = message_content.content
-
-            extracted_text = extract_text_from_pdf(file_content)
-            if "Error" in extracted_text:
-                line_bot_api.reply_message(tk, TextSendMessage(text=extracted_text))
-                return
-
-            user_data[user_id] = user_data.get(user_id, {})
-            user_data[user_id]["pdf_text"] = extracted_text
-            tokens, original_text = preprocess_text(extracted_text)
-            user_data[user_id]["pdf_tokens"] = tokens
-
-            quick_reply = QuickReply(
-                items=[
-                    QuickReplyButton(action=MessageAction(label="Translate PDF", text="Translate PDF")),
-                    QuickReplyButton(action=MessageAction(label="Ask Question", text="Ask about PDF")),
-                    QuickReplyButton(action=MessageAction(label="Cancel", text="Cancel PDF")),
-                ]
-            )
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(
-                    text="PDF processed successfully! Choose an action:",
-                    quick_reply=quick_reply
-                )
-            )
-        except LineBotApiError as e:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text=f"Error retrieving file: {str(e)}")
-            )
-        except Exception as e:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text=f"Error processing PDF: {str(e)}")
-            )
-    else:
-        line_bot_api.reply_message(
-            tk,
-            TextSendMessage(text="Please activate PDF scan mode by typing 'Scan PDF' first.")
-        )
-
-# -------- New Text Message Handler for PDF-Related Commands --------
-def handle_pdf_commands(tk, msg, user_id):
-    global last_msg  # Declare global at the start
-    if msg == "Scan PDF":
-        last_msg = "pdf_scan"
-        line_bot_api.reply_message(
-            tk,
-            TextSendMessage(text="Please upload a PDF file.")
-        )
-    elif msg == "Translate PDF":
-        if user_id in user_data and "pdf_text" in user_data[user_id]:
-            chooseLen(tk, user_data[user_id]["pdf_text"])
-        else:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text="No PDF text available. Please upload a PDF first.")
-            )
-    elif msg == "Ask about PDF":
-        if user_id in user_data and "pdf_text" in user_data[user_id]:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text="Please enter your question about the PDF content.")
-            )
-            last_msg = "pdf_qa"
-        else:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text="No PDF text available. Please upload a PDF first.")
-            )
-    elif msg == "Cancel PDF":
-        if user_id in user_data:
-            user_data[user_id].pop("pdf_text", None)
-            user_data[user_id].pop("pdf_tokens", None)
-        last_msg = ""
-        line_bot_api.reply_message(
-            tk,
-            TextSendMessage(text="PDF scan mode cancelled.")
-        )
-    elif last_msg == "pdf_qa":
-        if user_id in user_data and "pdf_text" in user_data[user_id]:
-            tokens = user_data[user_id]["pdf_tokens"]
-            original_text = user_data[user_id]["pdf_text"]
-            answer = simple_qa(msg, tokens, original_text)
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text=answer)
-            )
-            # Reset to allow another question or new action
-            quick_reply = QuickReply(
-                items=[
-                    QuickReplyButton(action=MessageAction(label="Ask Another Question", text="Ask about PDF")),
-                    QuickReplyButton(action=MessageAction(label="Translate PDF", text="Translate PDF")),
-                    QuickReplyButton(action=MessageAction(label="Cancel", text="Cancel PDF")),
-                ]
-            )
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(
-                    text="What would you like to do next?",
-                    quick_reply=quick_reply
-                )
-            )
-        else:
-            line_bot_api.reply_message(
-                tk,
-                TextSendMessage(text="No PDF text available. Please upload a PDF first.")
-            )
-            last_msg = ""
-
-# -------- 接收 LINE 訊息 --------
+# -------- Receiving LINE Messages --------
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']        
+    signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
     app.logger.info("Request body: " + body)
     try:
-        line_handler.handle(body, signature)  
+        line_handler.handle(body, signature)
     except:
-        print("error, but still work.") 
+        print("error, but still work.")
     return 'OK'
-
 
 @line_handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    global last_msg, memlist, random_list
+    global last_msg, memlist, random_list, user_pdf_data
     msg = event.message.text
     tk = event.reply_token
     user_id = event.source.user_id
     result = msg.split()
-
-    if msg in ["Scan PDF", "Translate PDF", "Ask about PDF", "Cancel PDF"] or last_msg == "pdf_qa":
-        handle_pdf_commands(tk, msg, user_id)
-        return
     
-    if msg == '抽籤':
+    # --- New ChatPDF Intent ---
+    if msg == 'ChatPDF':
+        line_bot_api.reply_message(tk, TextSendMessage(text='請上傳PDF檔案，或輸入問題來查詢已上傳的PDF內容。'))
+        last_msg = "chatpdf"
+    elif last_msg == "chatpdf" and msg != '關閉ChatPDF':
+        # Handle text queries about the PDF
+        if user_id in user_pdf_data and user_pdf_data[user_id]:
+            response = process_pdf_query(user_pdf_data[user_id], msg)
+            line_bot_api.reply_message(tk, TextSendMessage(text=response))
+        else:
+            line_bot_api.reply_message(tk, TextSendMessage(text='請先上傳PDF檔案。'))
+    elif msg == '關閉ChatPDF':
+        last_msg = ""
+        if user_id in user_pdf_data:
+            del user_pdf_data[user_id]
+            line_bot_api.reply_message(tk, TextSendMessage(text='ChatPDF功能已關閉。'))
+    
+    # Existing intents
+    elif msg == '抽籤':
         random_list.clear()
-        line_bot_api.reply_message(tk, TextSendMessage(text='給我一些想法! -> 推薦清單\n清空清單 -> 清單重置\n\n直接輸入文字將加入抽選項目中\n選項都加入完後 輸入開始抽籤吧'))
+        line_bot_api.reply_message(tk, TextSendMessage(text='給我一些想法 -> 推薦清單\n清空清單 -> 清單重置\n\n直接輸入文字將加入抽選項目中\n選項都加入完後 輸入開始抽籤吧'))
         last_msg = "random"
     elif msg == '查詢天氣':
         line_bot_api.reply_message(tk, TextSendMessage(text='請傳送位置資訊以查詢天氣與空氣品質'))
@@ -1141,9 +1031,8 @@ def handle_message(event):
     elif msg == '翻譯':
         line_bot_api.reply_message(tk, TextSendMessage(text='翻譯功能啟用\n請輸入欲翻譯的文字:'))
         last_msg = "translator"
-    elif msg == '我要記帳':
-        line_bot_api.reply_message(tk, choose(1,''))
-        user_data[user_id] = {"category": None, "amount": None}
+    elif msg == '記帳':
+        line_bot_api.reply_message(tk, TextSendMessage(text='請輸入關鍵字來進行記帳操作\n- 我要記帳\n- 查詢\n- 查 {類別}\n- 查詢日期 YYYY-MM-DD\n- 查詢月 YYYY-MM\n- 查詢月類別 YYYY-MM {類別}'))
         last_msg = "money"
     elif msg == '關閉記帳功能':
         last_msg = ""
@@ -1168,7 +1057,6 @@ def handle_message(event):
         intent = parse_intent(msg)
         calender(tk, intent, msg)
 
-
 @line_handler.add(MessageEvent, message=LocationMessage)
 def handle_location_message(event):
     global last_msg
@@ -1183,7 +1071,36 @@ def handle_location_message(event):
     elif last_msg == "weather":
         line_bot_api.reply_message(tk, TextSendMessage(text=weather(address)))
 
+@line_handler.add(MessageEvent, message=FileMessage)
+def handle_file_message(event):
+    global last_msg, user_pdf_data
+    tk = event.reply_token
+    user_id = event.source.user_id
+    file_id = event.message.file_id
+    file_name = event.message.file_name
     
+    if last_msg == "chatpdf" and file_name.lower().endswith('.pdf'):
+        # Get the file content from LINE
+        file_content = line_bot_api.get_message_content(file_id)
+        # Save to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+            for chunk in file_content.iter_content():
+                temp_file.write(chunk)
+            temp_file_path = temp_file.name
+        
+        # Extract text from PDF
+        pdf_text = extract_pdf_text(temp_file_path)
+        if pdf_text:
+            user_pdf_data[user_id] = pdf_text
+            line_bot_api.reply_message(tk, TextSendMessage(text='PDF已上傳並處理完成！請輸入問題來查詢PDF內容。'))
+        else:
+            line_bot_api.reply_message(tk, TextSendMessage(text='無法解析PDF內容，請檢查檔案。'))
+        
+        # Clean up temporary file
+        os.unlink(temp_file_path)
+    else:
+        line_bot_api.reply_message(tk, TextSendMessage(text='請在ChatPDF模式下上傳PDF檔案。'))
+
 @line_handler.add(PostbackEvent)
 def handle_postback(event):
     tk = event.reply_token
@@ -1198,4 +1115,5 @@ def handle_postback(event):
     line_bot_api.reply_message(tk, [TextMessage(text=result if result else "No translation available")])
 
 if __name__ == '__main__':
+    start_scheduler()
     app.run()
