@@ -1075,121 +1075,37 @@ def handle_location_message(event):
     elif last_msg == "weather":
         line_bot_api.reply_message(tk, TextSendMessage(text=weather(address)))
 
-# -------- Receiving LINE Messages --------
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers['X-Line-Signature']
-    body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
-    try:
-        line_handler.handle(body, signature)
-    except:
-        print("error, but still work.")
-    return 'OK'
-
-@line_handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    global last_msg, memlist, random_list, user_pdf_data
-    msg = event.message.text
-    tk = event.reply_token
-    user_id = event.source.user_id
-    result = msg.split()
-    
-    # --- New ChatPDF Intent ---
-    if msg == 'ChatPDF':
-        line_bot_api.reply_message(tk, TextSendMessage(text='請上傳PDF檔案，或輸入問題來查詢已上傳的PDF內容。'))
-        last_msg = "chatpdf"
-    elif last_msg == "chatpdf" and msg != '關閉ChatPDF':
-        # Handle text queries about the PDF
-        if user_id in user_pdf_data and user_pdf_data[user_id]:
-            response = process_pdf_query(user_pdf_data[user_id], msg)
-            line_bot_api.reply_message(tk, TextSendMessage(text=response))
-        else:
-            line_bot_api.reply_message(tk, TextSendMessage(text='請先上傳PDF檔案。'))
-    elif msg == '關閉ChatPDF':
-        last_msg = ""
-        if user_id in user_pdf_data:
-            del user_pdf_data[user_id]
-            line_bot_api.reply_message(tk, TextSendMessage(text='ChatPDF功能已關閉。'))
-    
-    # Existing intents
-    elif msg == '抽籤':
-        random_list.clear()
-        line_bot_api.reply_message(tk, TextSendMessage(text='給我一些想法 -> 推薦清單\n清空清單 -> 清單重置\n\n直接輸入文字將加入抽選項目中\n選項都加入完後 輸入開始抽籤吧'))
-        last_msg = "random"
-    elif msg == '查詢天氣':
-        line_bot_api.reply_message(tk, TextSendMessage(text='請傳送位置資訊以查詢天氣與空氣品質'))
-        last_msg = "weather"
-    elif msg == '翻譯':
-        line_bot_api.reply_message(tk, TextSendMessage(text='翻譯功能啟用\n請輸入欲翻譯的文字:'))
-        last_msg = "translator"
-    elif msg == '記帳':
-        line_bot_api.reply_message(tk, TextSendMessage(text='請輸入關鍵字來進行記帳操作\n- 我要記帳\n- 查詢\n- 查 {類別}\n- 查詢日期 YYYY-MM-DD\n- 查詢月 YYYY-MM\n- 查詢月類別 YYYY-MM {類別}'))
-        last_msg = "money"
-    elif msg == '關閉記帳功能':
-        last_msg = ""
-    elif msg == '查詢附近美食與景點':
-        foodie(tk, user_id, result)
-        last_msg = "foodie02"
-    elif msg == '行事曆':
-        line_bot_api.reply_message(tk, TextSendMessage(text='新增行程/刪除行程/查詢行程'))
-        last_msg = "calender"
-    elif msg == '關閉行事曆':
-        last_msg = ""
-    elif last_msg == "random":
-        last_msg, memlist = randomone(tk, msg, last_msg, memlist)
-    elif last_msg == "translator":
-        chooseLen(tk, msg)
-        last_msg = ""
-    elif last_msg == "money":
-        money(tk, msg, user_id)
-    elif last_msg == "foodie02":
-        foodie(tk, user_id, result)
-    elif last_msg == "calender":
-        intent = parse_intent(msg)
-        calender(tk, intent, msg)
-
-@line_handler.add(MessageEvent, message=LocationMessage)
-def handle_location_message(event):
-    global last_msg
-    tk = event.reply_token
-    address = event.message.address.replace('台', '臺')
-    latitude = event.message.latitude
-    longitude = event.message.longitude
-    user_id = event.source.user_id
-    if last_msg == "foodie02":
-        location(latitude, longitude, user_id, tk)
-        last_msg = "foodie02"
-    elif last_msg == "weather":
-        line_bot_api.reply_message(tk, TextSendMessage(text=weather(address)))
-
 @line_handler.add(MessageEvent, message=FileMessage)
 def handle_file_message(event):
     global last_msg, user_pdf_data
     tk = event.reply_token
     user_id = event.source.user_id
-    file_id = event.message.file_id
+    file_id = event.message.id  # 使用 message.id 獲取檔案 ID
     file_name = event.message.file_name
     
     if last_msg == "chatpdf" and file_name.lower().endswith('.pdf'):
-        # Get the file content from LINE
-        file_content = line_bot_api.get_message_content(file_id)
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-            for chunk in file_content.iter_content():
-                temp_file.write(chunk)
-            temp_file_path = temp_file.name
-        
-        # Extract text from PDF
-        pdf_text = extract_pdf_text(temp_file_path)
-        if pdf_text:
-            user_pdf_data[user_id] = pdf_text
-            line_bot_api.reply_message(tk, TextSendMessage(text='PDF已上傳並處理完成！請輸入問題來查詢PDF內容。'))
-        else:
-            line_bot_api.reply_message(tk, TextSendMessage(text='無法解析PDF內容，請檢查檔案。'))
-        
-        # Clean up temporary file
-        os.unlink(temp_file_path)
+        try:
+            # 從 LINE 下載檔案內容
+            file_content = line_bot_api.get_message_content(file_id)
+            # 使用 tempfile 儲存 PDF
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                for chunk in file_content.iter_content():
+                    temp_file.write(chunk)
+                temp_file_path = temp_file.name
+            
+            # 提取 PDF 文字
+            pdf_text = extract_pdf_text(temp_file_path)
+            if pdf_text:
+                user_pdf_data[user_id] = pdf_text
+                line_bot_api.reply_message(tk, TextSendMessage(text='PDF已上傳並處理完成！請輸入問題來查詢PDF內容。'))
+            else:
+                line_bot_api.reply_message(tk, TextSendMessage(text='無法解析PDF內容，請檢查檔案是否有效。'))
+            
+            # 清理臨時檔案
+            os.unlink(temp_file_path)
+        except Exception as e:
+            print(f"處理 PDF 時發生錯誤: {e}")
+            line_bot_api.reply_message(tk, TextSendMessage(text=f'處理 PDF 失敗：{str(e)}'))
     else:
         line_bot_api.reply_message(tk, TextSendMessage(text='請在ChatPDF模式下上傳PDF檔案。'))
 
