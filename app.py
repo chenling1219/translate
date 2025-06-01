@@ -13,15 +13,14 @@ from datetime import datetime, timedelta, timezone
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from apscheduler.schedulers.background import BackgroundScheduler
-# --- New imports for ChatPDF ---
+from openai import OpenAI
 import pdfplumber
 import tempfile
 
 random_list = []
 last_msg = ""
 memlist = ""
-# --- New global variable for ChatPDF ---
-user_pdf_data = {}  # Store PDF text per user
+user_pdf_data = {}  
 
 app = Flask(__name__)
 
@@ -35,9 +34,6 @@ line_handler = WebhookHandler(channel_secret)
 API_KEY = os.getenv("API_KEY")
 ENDPOINT = os.getenv("ENDPOINT")
 REGION = os.getenv("REGION")
-
-# --- New environment variable for ChatPDF (if using AI, e.g., OpenAI) ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # Uncomment if using OpenAI
 
 # money
 def setup_sheets_client():
@@ -74,23 +70,31 @@ def extract_pdf_text(file_path):
         print(f"PDF extraction failed: {e}")
         return None
 
-def process_pdf_query(pdf_text, query):
-    """Process a user query about the PDF content (simple keyword search)."""
-    # Replace this with AI-based processing (e.g., OpenAI) if needed
-    if not pdf_text:
-        return "No PDF content available."
-    # Simple keyword-based response
-    if query.lower() in pdf_text.lower():
-        # Find relevant snippet (first 100 characters around the keyword)
-        index = pdf_text.lower().index(query.lower())
-        start = max(0, index - 50)
-        end = min(len(pdf_text), index + len(query) + 50)
-        snippet = pdf_text[start:end]
-        return f"Found in PDF: ...{snippet}..."
-    return "No relevant information found for your query."
+# 初始化 OpenAI 客戶端
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Existing functions (foodpush, drinkpush, listpush, randomone, weather, azure_translate, choose, money, foodie, location, get_calendar_service, add_event, delete_event_by_keyword, get_today_events, parse_intent, extract_datetime, extract_event_info, daily_push, calender, start_scheduler) remain unchanged.
-# [Existing functions omitted for brevity; assume they are included here as in the original app.py]
+def process_pdf_query(pdf_text, query):
+    if not pdf_text:
+        return 
+    
+    try:
+        prompt = f"以下是 PDF 內容：\n\n{pdf_text}\n\n用戶問題：{query}\n\n請根據 PDF 內容回答問題，並以繁體中文回覆。"
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "你是一個能閱讀 PDF 內容並回答問題的助手。"},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.7
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        return answer if answer else "無法根據 PDF 內容回答你的問題。"
+    except Exception as e:
+        print(f"OpenAI 處理失敗: {e}")
+        return f"處理查詢時發生錯誤：{str(e)}"
 
 # -------- 抽籤功能 --------
 def foodpush():
@@ -982,6 +986,94 @@ def start_scheduler():
     scheduler = BackgroundScheduler()
     scheduler.add_job(daily_push, 'cron', hour=8, minute=0)
     scheduler.start()
+
+# -------- Receiving LINE Messages --------
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers['X-Line-Signature']
+    body = request.get_data(as_text=True)
+    app.logger.info("Request body: " + body)
+    try:
+        line_handler.handle(body, signature)
+    except:
+        print("error, but still work.")
+    return 'OK'
+
+@line_handler.add(MessageEvent, message=TextMessage)
+def handle_message(event):
+    global last_msg, memlist, random_list, user_pdf_data
+    msg = event.message.text
+    tk = event.reply_token
+    user_id = event.source.user_id
+    result = msg.split()
+    
+    # --- New ChatPDF Intent ---
+    if msg == 'ChatPDF':
+        line_bot_api.reply_message(tk, TextSendMessage(text='請上傳PDF檔案，或輸入問題來查詢已上傳的PDF內容。'))
+        last_msg = "chatpdf"
+    elif last_msg == "chatpdf" and msg != '關閉ChatPDF':
+        # Handle text queries about the PDF
+        if user_id in user_pdf_data and user_pdf_data[user_id]:
+            response = process_pdf_query(user_pdf_data[user_id], msg)
+            line_bot_api.reply_message(tk, TextSendMessage(text=response))
+        else:
+            line_bot_api.reply_message(tk, TextSendMessage(text='請先上傳PDF檔案。'))
+    elif msg == '關閉ChatPDF':
+        last_msg = ""
+        if user_id in user_pdf_data:
+            del user_pdf_data[user_id]
+            line_bot_api.reply_message(tk, TextSendMessage(text='ChatPDF功能已關閉。'))
+    
+    # Existing intents
+    elif msg == '抽籤':
+        random_list.clear()
+        line_bot_api.reply_message(tk, TextSendMessage(text='給我一些想法 -> 推薦清單\n清空清單 -> 清單重置\n\n直接輸入文字將加入抽選項目中\n選項都加入完後 輸入開始抽籤吧'))
+        last_msg = "random"
+    elif msg == '查詢天氣':
+        line_bot_api.reply_message(tk, TextSendMessage(text='請傳送位置資訊以查詢天氣與空氣品質'))
+        last_msg = "weather"
+    elif msg == '翻譯':
+        line_bot_api.reply_message(tk, TextSendMessage(text='翻譯功能啟用\n請輸入欲翻譯的文字:'))
+        last_msg = "translator"
+    elif msg == '記帳':
+        line_bot_api.reply_message(tk, TextSendMessage(text='請輸入關鍵字來進行記帳操作\n- 我要記帳\n- 查詢\n- 查 {類別}\n- 查詢日期 YYYY-MM-DD\n- 查詢月 YYYY-MM\n- 查詢月類別 YYYY-MM {類別}'))
+        last_msg = "money"
+    elif msg == '關閉記帳功能':
+        last_msg = ""
+    elif msg == '查詢附近美食與景點':
+        foodie(tk, user_id, result)
+        last_msg = "foodie02"
+    elif msg == '行事曆':
+        line_bot_api.reply_message(tk, TextSendMessage(text='新增行程/刪除行程/查詢行程'))
+        last_msg = "calender"
+    elif msg == '關閉行事曆':
+        last_msg = ""
+    elif last_msg == "random":
+        last_msg, memlist = randomone(tk, msg, last_msg, memlist)
+    elif last_msg == "translator":
+        chooseLen(tk, msg)
+        last_msg = ""
+    elif last_msg == "money":
+        money(tk, msg, user_id)
+    elif last_msg == "foodie02":
+        foodie(tk, user_id, result)
+    elif last_msg == "calender":
+        intent = parse_intent(msg)
+        calender(tk, intent, msg)
+
+@line_handler.add(MessageEvent, message=LocationMessage)
+def handle_location_message(event):
+    global last_msg
+    tk = event.reply_token
+    address = event.message.address.replace('台', '臺')
+    latitude = event.message.latitude
+    longitude = event.message.longitude
+    user_id = event.source.user_id
+    if last_msg == "foodie02":
+        location(latitude, longitude, user_id, tk)
+        last_msg = "foodie02"
+    elif last_msg == "weather":
+        line_bot_api.reply_message(tk, TextSendMessage(text=weather(address)))
 
 # -------- Receiving LINE Messages --------
 @app.route("/callback", methods=['POST'])
