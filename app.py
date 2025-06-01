@@ -75,15 +75,16 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 在檔案頂部加入快取相關匯入
 from cachetools import TTLCache
-from ratelimiter import RateLimiter
+from aiolimiter import AsyncLimiter
 
 # 初始化快取（TTL 快取，儲存 5 分鐘）
 query_cache = TTLCache(maxsize=1000, ttl=300)
 
 # 初始化速率限制（每分鐘最多 20 次請求）
-rate_limiter = RateLimiter(max_calls=20, period=60)
+rate_limiter = AsyncLimiter(20, 60)  # 每 60 秒最多 20 次請求
 
-def process_pdf_query(pdf_text, query):
+async def process_pdf_query(pdf_text, query):
+    """使用 OpenAI 處理用戶對 PDF 內容的查詢，並加入快取和速率限制"""
     if not pdf_text:
         return "沒有可用的 PDF 內容。"
     
@@ -92,7 +93,8 @@ def process_pdf_query(pdf_text, query):
         return query_cache[cache_key]
     
     try:
-        with rate_limiter:
+        # 應用速率限制
+        async with rate_limiter:
             prompt = f"以下是 PDF 內容：\n\n{pdf_text}\n\n用戶問題：{query}\n\n請根據 PDF 內容回答問題，並以繁體中文回覆。"
             response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
@@ -1025,22 +1027,19 @@ def handle_message(event):
     user_id = event.source.user_id
     result = msg.split()
     
-    # --- New ChatPDF Intent ---
     if msg == 'ChatPDF':
         line_bot_api.reply_message(tk, TextSendMessage(text='請上傳PDF檔案，或輸入問題來查詢已上傳的PDF內容。'))
         last_msg = "chatpdf"
     elif last_msg == "chatpdf" and msg != '關閉ChatPDF':
-        # Handle text queries about the PDF
+        # 假設 process_pdf_query 是 async 函數，需使用 asyncio 運行
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         if user_id in user_pdf_data and user_pdf_data[user_id]:
-            response = process_pdf_query(user_pdf_data[user_id], msg)
+            response = loop.run_until_complete(process_pdf_query(user_pdf_data[user_id], msg))
             line_bot_api.reply_message(tk, TextSendMessage(text=response))
         else:
             line_bot_api.reply_message(tk, TextSendMessage(text='請先上傳PDF檔案。'))
-    elif msg == '關閉ChatPDF':
-        last_msg = ""
-        if user_id in user_pdf_data:
-            del user_pdf_data[user_id]
-            line_bot_api.reply_message(tk, TextSendMessage(text='ChatPDF功能已關閉。'))
     
     # Existing intents
     elif msg == '抽籤':
