@@ -13,4 +13,7 @@ nltk==3.8.1
 requests
 google-auth
 pdfplumber
-openai  # Uncomment if using OpenAI
+openai 
+
+cachetools
+ratelimiter
