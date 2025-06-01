@@ -16,4 +16,4 @@ pdfplumber
 openai 
 
 cachetools
-ratelimiter
+aiolimiter
