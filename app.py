@@ -112,24 +112,7 @@ def process_pdf_query(pdf_text, query):
         if "insufficient_quota" in error_msg:
             return "很抱歉，目前 OpenAI API 配額已用完，請稍後再試或聯繫管理員升級計畫。"
         return f"處理查詢時發生錯誤：{error_msg}"
-        
-        # 提取 OpenAI 的回應
-        answer = response.choices[0].message.content.strip()
-        # 儲存回應到快取
-        query_cache[cache_key] = answer
-        return answer if answer else "無法根據 PDF 內容回答你的問題。"
-    except Exception as e:
-        print(f"OpenAI 處理失敗: {e}")
-        return f"處理查詢時發生錯誤：{str(e)}"
-        
-        # 提取 OpenAI 的回應
-        answer = response.choices[0].message.content.strip()
-        # 儲存回應到快取
-        query_cache[cache_key] = answer
-        return answer if answer else "無法根據 PDF 內容回答你的問題。"
-    except Exception as e:
-        print(f"OpenAI 處理失敗: {e}")
-        return f"處理查詢時發生錯誤：{str(e)}"
+
 
 # -------- 抽籤功能 --------
 def foodpush():
