@@ -73,24 +73,59 @@ def extract_pdf_text(file_path):
 # 初始化 OpenAI 客戶端
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# 在檔案頂部加入快取相關匯入
+from cachetools import TTLCache
+from ratelimiter import RateLimiter
+
+# 初始化快取（TTL 快取，儲存 5 分鐘）
+query_cache = TTLCache(maxsize=1000, ttl=300)
+
+# 初始化速率限制（每分鐘最多 20 次請求）
+rate_limiter = RateLimiter(max_calls=20, period=60)
+
 def process_pdf_query(pdf_text, query):
     if not pdf_text:
-        return 
+        return "沒有可用的 PDF 內容。"
+    
+    cache_key = f"{pdf_text[:50]}{query}"
+    if cache_key in query_cache:
+        return query_cache[cache_key]
     
     try:
-        prompt = f"以下是 PDF 內容：\n\n{pdf_text}\n\n用戶問題：{query}\n\n請根據 PDF 內容回答問題，並以繁體中文回覆。"
+        with rate_limiter:
+            prompt = f"以下是 PDF 內容：\n\n{pdf_text}\n\n用戶問題：{query}\n\n請根據 PDF 內容回答問題，並以繁體中文回覆。"
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "你是一個能閱讀 PDF 內容並回答問題的助手。"},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.7
+            )
+            answer = response.choices[0].message.content.strip()
+            query_cache[cache_key] = answer
+            return answer if answer else "無法根據 PDF 內容回答你的問題。"
+    except Exception as e:
+        print(f"OpenAI 處理失敗: {e}")
+        error_msg = str(e)
+        if "insufficient_quota" in error_msg:
+            return "很抱歉，目前 OpenAI API 配額已用完，請稍後再試或聯繫管理員升級計畫。"
+        return f"處理查詢時發生錯誤：{error_msg}"
         
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "你是一個能閱讀 PDF 內容並回答問題的助手。"},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.7
-        )
-        
+        # 提取 OpenAI 的回應
         answer = response.choices[0].message.content.strip()
+        # 儲存回應到快取
+        query_cache[cache_key] = answer
+        return answer if answer else "無法根據 PDF 內容回答你的問題。"
+    except Exception as e:
+        print(f"OpenAI 處理失敗: {e}")
+        return f"處理查詢時發生錯誤：{str(e)}"
+        
+        # 提取 OpenAI 的回應
+        answer = response.choices[0].message.content.strip()
+        # 儲存回應到快取
+        query_cache[cache_key] = answer
         return answer if answer else "無法根據 PDF 內容回答你的問題。"
     except Exception as e:
         print(f"OpenAI 處理失敗: {e}")
